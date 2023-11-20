@@ -217,6 +217,17 @@ class Conversation:
             "sep2": self.sep2,
         }
 
+    @classmethod
+    def from_dict(cls, d):
+        conv = Conversation(d["system"],
+                            d["roles"],
+                            [(x, y) for x, y in d["messages"]],
+                            d["offset"],
+                            SeparatorStyle.SINGLE,
+                            d["sep"],
+                            d["sep2"])
+        return conv
+
 
 conv_vicuna_v0 = Conversation(
     system="A chat between a curious human and an artificial intelligence assistant. "

@@ -1,8 +1,11 @@
 import argparse
+from httpx import stream
 import torch
+import dataclasses
+import json
 
 from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
-from llava.conversation import conv_templates, SeparatorStyle
+from llava.conversation import Conversation, conv_templates, SeparatorStyle
 from llava.model.builder import load_pretrained_model
 from llava.utils import disable_torch_init
 from llava.mm_utils import process_images, tokenizer_image_token, get_model_name_from_path, KeywordsStoppingCriteria
@@ -67,21 +70,24 @@ def main(args):
     # if not inp:
     #     print("exit...")
     #     break
-    inp = args.conv_file
+    # inp = args.conv_file
+    with open(args.conv_file, 'r') as f:
+        conv_dict = json.load(f)
+    conv = Conversation.from_dict(conv_dict)
 
     print(f"{roles[1]}: ", end="")
 
-    if image is not None:
-        # first message
-        if model.config.mm_use_im_start_end:
-            inp = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + inp
-        else:
-            inp = DEFAULT_IMAGE_TOKEN + '\n' + inp
-        conv.append_message(conv.roles[0], inp)
-        image = None
-    else:
-        # later messages
-        conv.append_message(conv.roles[0], inp)
+    # if image is not None:
+    #     # first message
+    #     if model.config.mm_use_im_start_end:
+    #         inp = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + inp
+    #     else:
+    #         inp = DEFAULT_IMAGE_TOKEN + '\n' + inp
+    #     conv.append_message(conv.roles[0], inp)
+    #     image = None
+    # else:
+    #     # later messages
+    #     conv.append_message(conv.roles[0], inp)
     conv.append_message(conv.roles[1], None)
     prompt = conv.get_prompt()
 
@@ -91,22 +97,42 @@ def main(args):
     stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
     streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
 
-    with torch.inference_mode():
-        output_ids = model.generate(
-            input_ids,
-            images=image_tensor,
-            do_sample=True if args.temperature > 0 else False,
-            temperature=args.temperature,
-            max_new_tokens=args.max_new_tokens,
-            streamer=streamer,
-            use_cache=True,
-            stopping_criteria=[stopping_criteria])
+    batch_size = 1
+    input_ids = input_ids.repeat(batch_size, 1)
+    image_tensor = image_tensor.repeat(batch_size, 1, 1, 1)
+    if batch_size != 1:
+        streamer = None
 
-    outputs = tokenizer.decode(output_ids[0, input_ids.shape[1]:]).strip()
+    print("input_ids.shape", input_ids.shape)
+    n_iters = 1
+
+    for i in range(n_iters):
+        if i == 3:
+            torch.cuda.profiler.cudart().cudaProfilerStart()
+        if i == 4:
+            torch.cuda.profiler.cudart().cudaProfilerStop()
+        with torch.inference_mode():
+            output_ids = model.generate(
+                input_ids,
+                images=image_tensor,
+                do_sample=True if args.temperature > 0 else False,
+                temperature=args.temperature,
+                max_new_tokens=args.max_new_tokens,
+                streamer=streamer,
+                use_cache=True,
+                stopping_criteria=[stopping_criteria])
+        print("output_ids.shape", output_ids.shape)
+
+        outputs = tokenizer.decode(output_ids[0, input_ids.shape[1]:]).strip()
     conv.messages[-1][-1] = outputs
 
     if args.debug:
         print("\n", {"prompt": prompt, "outputs": outputs}, "\n")
+    
+    # with open('/root/LLaVA/serving_testcases/conv.json', 'w') as f:
+    #     conv_dict = conv.dict()
+    #     json.dump(conv_dict, f, indent=4)
+    
 
 
 if __name__ == "__main__":
