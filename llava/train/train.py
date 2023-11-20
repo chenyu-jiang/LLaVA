@@ -25,6 +25,8 @@ from typing import Dict, Optional, Sequence, List
 import torch
 
 import transformers
+from transformers import TrainerCallback, TrainerControl, TrainerState
+from transformers.training_args import TrainingArguments
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from torch.utils.data import Dataset
@@ -752,10 +754,54 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                 eval_dataset=None,
                 data_collator=data_collator)
 
+class ReportMemoryCallback(TrainerCallback):
+    def on_step_begin(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        # get current memory usage
+        self.current_bytes = torch.cuda.memory_allocated()
+        # clear peak memory usage
+        torch.cuda.reset_peak_memory_stats()
+        if state.global_step == 10:
+            torch.cuda.profiler.cudart().cudaProfilerStart()
+
+    def on_step_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        import deepspeed.comm as dist
+        import pickle
+
+        # get peak memory usage
+        peak_bytes = torch.cuda.max_memory_allocated()
+        # report memory usage
+        activation_bytes = peak_bytes - self.current_bytes
+        activation_megabytes = activation_bytes / 1000 / 1000
+        rank = dist.get_rank()
+        print(f"[Rank {rank}] Peak Activation Mem Usage: {activation_megabytes:.2f} MB")
+        print(f"[Rank {rank}] Total Model State Usage: "
+              f"{self.current_bytes / 1000 / 1000:.2f} MB")
+        # take a memory snapshot
+        # snapshot = torch.cuda.memory._snapshot()
+        # with open(f"/root/LLaVA/memory_snapshots/memory_r{rank}_step{state.global_step}.pkl", "wb") as f:
+        #     pickle.dump(snapshot, f)
+        # print on first step
+        if state.global_step == 1:
+            md = kwargs.get("model", None)
+            assert md is not None, "Model is None in ReportMemoryCallback"
+            print(f"[Rank {rank}] After initing trainer")
+            total_param = sum(p.numel() * p.element_size() for p in md.parameters())
+            vision_tower_param = sum(p.numel() * p.element_size() for p in md.get_vision_tower().parameters())
+            adapter_param = sum(p.numel() * p.element_size() for p in md.get_model().mm_projector.parameters())
+            llm_param = total_param - vision_tower_param - adapter_param
+            print("[Rank {}] Parameter dtype: {}".format(rank, md.parameters().__next__().dtype))
+            print(f"[Rank {rank}] Total Parameters: {total_param / 1e6:.2f} MB")
+            print(f"[Rank {rank}] Vision Tower Parameters: {vision_tower_param / 1e6:.2f} MB")
+            print(f"[Rank {rank}] Adapter Parameters: {adapter_param / 1e6:.2f} MB")
+            print(f"[Rank {rank}] LLM Parameters: {llm_param / 1e6:.2f} MB")
+        if state.global_step == 15:
+            torch.cuda.profiler.cudart().cudaProfilerStop()
+
 
 def train():
     global local_rank
 
+    # torch.cuda.memory._record_memory_history(True, trace_alloc_record_context=True)
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
@@ -922,10 +968,27 @@ def train():
 
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)
+    
+    def print_model_params(md):
+        total_param = sum(p.numel() * p.element_size() for p in md.parameters())
+        vision_tower_param = sum(p.numel() * p.element_size() for p in md.get_vision_tower().parameters())
+        adapter_param = sum(p.numel() * p.element_size() for p in md.get_model().mm_projector.parameters())
+        llm_param = total_param - vision_tower_param - adapter_param
+        print("[Local Rank {}] Parameter dtype: {}".format(local_rank, md.parameters().__next__().dtype))
+        print(f"[Local Rank {local_rank}] Total Parameters: {total_param / 1e6:.2f} MB")
+        print(f"[Local Rank {local_rank}] Vision Tower Parameters: {vision_tower_param / 1e6:.2f} MB")
+        print(f"[Local Rank {local_rank}] Adapter Parameters: {adapter_param / 1e6:.2f} MB")
+        print(f"[Local Rank {local_rank}] LLM Parameters: {llm_param / 1e6:.2f} MB")
+
+    print_model_params(model)
+    print(f"[Local Rank {local_rank}] Model "
+          "Trainable Parameters: "
+          f"{sum(p.numel() * p.element_size() for p in model.parameters() if p.requires_grad) / 1e6:.2f} MB")
     trainer = LLaVATrainer(model=model,
                     tokenizer=tokenizer,
                     args=training_args,
                     **data_module)
+    trainer.add_callback(ReportMemoryCallback)
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)

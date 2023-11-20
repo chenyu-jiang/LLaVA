@@ -92,8 +92,16 @@ class LlavaMetaForCausalLM(ABC):
         return self.get_model().get_vision_tower()
 
     def encode_images(self, images):
+        torch.cuda.nvtx.range_push("vision_encoder")
+        image_shape = images.shape
+        print(f"image_shape: {image_shape}, total size: {images.numel() * images.element_size() / 1024 / 1024} MB")
         image_features = self.get_model().get_vision_tower()(images)
+        print(f"image features shape: {image_features.shape}, total size: {image_features.numel() * image_features.element_size() / 1024 / 1024} MB")
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("mm_projector")
         image_features = self.get_model().mm_projector(image_features)
+        print(f"image features shape after mm projector: {image_features.shape}, total size: {image_features.numel() * image_features.element_size() / 1024 / 1024} MB")
+        torch.cuda.nvtx.range_pop()
         return image_features
 
     def prepare_inputs_labels_for_multimodal(
@@ -223,6 +231,8 @@ class LlavaMetaForCausalLM(ABC):
                     position_ids[i, :cur_len] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=position_ids.device)
 
         new_input_embeds = torch.stack(new_input_embeds_padded, dim=0)
+
+        print("LLM Input shape: ", new_input_embeds.shape)
 
         if _labels is None:
             new_labels = None
